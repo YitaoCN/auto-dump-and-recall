@@ -1,113 +1,144 @@
 ---
 name: context-session-manager
-description: 自动管理长对话的上下文存储与召回。当对话轮次增多导致上下文窗口接近饱和时，自动将会话摘要和关键状态持久化到文件系统；当用户发送 /new 或新会话开始时，自动检索并召回上一个会话的上下文摘要，实现跨会话记忆连续性。适用于：长时间多轮对话、需要断点续作的开发任务、跨会话保持项目上下文的场景。触发关键词：上下文存储、会话管理、/new、新会话、断点续作、上下文召回、会话摘要。
+description: 自动管理长对话的上下文存储与召回。当对话轮次增多导致上下文窗口接近饱和时，自动将会话摘要和关键状态持久化到文件系统；当用户发送 /new 或新会话开始时，自动检索并召回上一个会话的上下文摘要，实现跨会话记忆连续性。适用于：长时间多轮对话、需要断点续作的开发任务、跨会话保持项目上下文的场景。触发关键词：上下文存储、会话管理、/new、新会话、断点续作、上下文召回、会话摘要、新对话、继续之前。
 ---
 
 # 上下文会话管理器
 
-## 工作原理
+## 核心规则
 
-两阶段循环：
+本技能的指令是**确定性执行指令**，不是可选建议。满足触发条件时必须执行，不得跳过。
 
-1. **存储**：每次对话时检测上下文长度，接近饱和时自动生成会话摘要并持久化
-2. **召回**：用户发送 `/new` 或检测到新会话时，自动检索最近的会话摘要并注入上下文
+## 触发钩子
 
-## 存储策略
+### 钩子 A：会话结束前自动存储（必执行）
 
-### 何时触发存储
+**触发条件**（满足任一即触发）：
 
-在每个响应生成前，评估当前对话是否需要存储。触发条件（满足任一）：
+1. 对话轮次（用户消息数）>= 8 轮
+2. 当前会话产生了文件、代码、报告等可交付物
+3. 当前会话包含架构决策、技术选型等高价值结论
+4. 用户明确说"记住"、"保存"、"存一下"
 
-- 对话轮次 >= 8 轮（用户+助手各算一轮）
-- 当前会话包含用户明确要求"记住"/"保存"/"存一下"等意图
-- 当前会话包含代码提交、文件创建、架构决策等高价值操作结果
+**执行时机**：在生成最终回复之前（即回复内容写完后、调用工具输出之前），先执行存储。
 
-### 如何存储
+**执行步骤**（严格按此顺序）：
 
-使用 `scripts/store_session.py` 执行存储：
+1. 用 `jupyter_cell_exec` 执行以下代码，创建会话目录并写入摘要：
 
-```bash
-python3 scripts/store_session.py --session-id <id> --workspace <workspace> --content <content>
+```python
+import os, json
+from datetime import datetime
+
+cwd = os.getcwd()
+session_dir = os.path.join(cwd, '.context-sessions')
+os.makedirs(session_dir, exist_ok=True)
+
+session_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+
+# === 在此处替换为实际摘要内容 ===
+summary = """
+[在此处写入 3-8 句话的会话摘要]
+- 任务目标：用户要求做什么
+- 已完成：做了什么，产出了哪些文件/代码
+- 关键决策：做了哪些技术选型
+- 当前状态：做到哪一步，是否有未完成的部分
+- 下一步：还有什么没做
+"""
+
+record = {
+    "session_id": session_id,
+    "stored_at": datetime.now().isoformat(),
+    "summary": summary.strip(),
+    "key_decisions": [],
+    "files_modified": [],
+    "next_steps": [],
+    "tags": []
+}
+
+filepath = os.path.join(session_dir, session_id + '.json')
+with open(filepath, 'w', encoding='utf-8') as f:
+    json.dump(record, f, ensure_ascii=False, indent=2)
+
+# 清理：只保留最近 20 个
+import glob
+files = sorted(glob.glob(os.path.join(session_dir, '*.json')))
+if len(files) > 20:
+    for old in files[:-20]:
+        os.remove(old)
+
+print("STORED:" + session_id + " at " + filepath)
 ```
 
-参数：
-- `--session-id`：会话标识，格式 `{workspace}/sessions/{YYYYMMDD-HHmmss}`
-- `--workspace`：工作区路径（来自 `workspace_dir` 环境变量）
-- `--content`：要存储的摘要内容（Markdown 格式）
+2. 在上面的代码中，将 `summary`、`key_decisions`、`files_modified`、`next_steps`、`tags` 替换为当前会话的实际内容。
 
-存储格式为 JSON 文件，包含：
-- `session_id`、`started_at`、`stored_at`
-- `summary`：会话摘要（由调用者生成，3-8句话）
-- `key_decisions`：关键决策列表
-- `files_modified`：修改过的文件列表
-- `next_steps`：待办/下一步
-- `tags`：自动提取的标签
+3. 正常回复用户，不需要告知用户存储动作（静默执行）。
 
-存储位置：`{workspace}/.context-sessions/{YYYYMMDD-HHmmss}.json`
+### 钩子 B：新会话自动召回（必执行）
 
-### 摘要生成规则
+**触发条件**（满足任一即触发）：
 
-摘要应包含以下要素（按重要性排序）：
+1. 用户消息为 `/new` 或"新会话"、"重新开始"、"继续之前的工作"、"上次我们聊到"
+2. 对话开头检测到 `.context-sessions/` 目录存在且有历史会话文件
+
+**执行步骤**：
+
+1. 用 `jupyter_cell_exec` 执行以下代码：
+
+```python
+import os, json, glob
+
+cwd = os.getcwd()
+session_dir = os.path.join(cwd, '.context-sessions')
+
+if not os.path.exists(session_dir):
+    print("NO_SESSIONS")
+else:
+    files = sorted(glob.glob(os.path.join(session_dir, '*.json')), reverse=True)[:3]
+    if not files:
+        print("NO_SESSIONS")
+    else:
+        sessions = []
+        for f in files:
+            with open(f, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            sessions.append({
+                "id": data.get("session_id"),
+                "time": data.get("stored_at"),
+                "summary": data.get("summary", ""),
+                "decisions": data.get("key_decisions", []),
+                "files": data.get("files_modified", []),
+                "next_steps": data.get("next_steps", []),
+                "tags": data.get("tags", [])
+            })
+        print(json.dumps(sessions, ensure_ascii=False, indent=2))
+```
+
+2. 读取召回结果。如果输出 `NO_SESSIONS`，跳过后续步骤。
+
+3. 将召回的摘要注入当前上下文，并在回复中告知用户：
+
+> 已召回最近会话上下文（{时间}），上次完成了 {摘要要点}。需要继续吗？
+
+4. 用户确认继续后，基于召回的上下文恢复工作状态。
+
+## 摘要生成规则
+
+摘要必须包含以下要素（按重要性排序）：
 
 1. **任务目标**：用户要做什么
-2. **已完成事项**：做了什么、产生了哪些文件/代码
-3. **当前状态**：做到哪一步、是否有未完成的部分
-4. **关键决策**：做了哪些技术选型或方案选择
+2. **已完成**：做了什么、产生了哪些文件/代码（写完整路径）
+3. **关键决策**：做了哪些技术选型或方案选择
+4. **当前状态**：做到哪一步、是否有未完成的部分
 5. **下一步**：还有什么没做
 
-摘要长度控制在 200-500 字。使用 Markdown 列表格式。
+摘要长度控制在 200-500 字。用 Markdown 列表格式。
 
-## 召回策略
-
-### 何时触发召回
-
-- 用户消息为 `/new` 或"新会话"、"重新开始"等
-- 检测到系统提示中的 `session_id` 变化（新会话标识）
-- 用户说"上次我们聊到..."、"继续之前的工作"等
-
-### 如何召回
-
-使用 `scripts/recall_session.py` 执行召回：
-
-```bash
-python3 scripts/recall_session.py --workspace <workspace> [--limit 3] [--tags <tags>]
-```
-
-参数：
-- `--workspace`：工作区路径
-- `--limit`：召回最近的 N 个会话摘要（默认 3）
-- `--tags`：按标签过滤（可选，逗号分隔）
-
-返回：按时间倒序排列的会话摘要列表（JSON）
-
-### 召回后的处理
-
-召回会话摘要后，在回复用户时：
-
-1. 简要告知用户："已召回上一个会话上下文，上次我们完成了 [摘要要点]。需要继续吗？"
-2. 不要把完整摘要内容展示给用户，只在内部参考
-3. 如果用户确认继续，基于召回的上下文恢复工作状态
-
-## 完整工作流
-
-```
-对话开始
-  │
-  ├─ 检测到 /new ──→ recall_session.py ──→ 注入上下文 ──→ 告知用户
-  │
-  ├─ 每轮响应后
-  │    └─ 评估：轮次>=8 或 高价值操作？
-  │         ├─ 是 ──→ 生成摘要 ──→ store_session.py ──→ 持久化
-  │         └─ 否 ──→ 继续
-  │
-  └─ 对话结束
-       └─ 如果未存储 ──→ 强制存储当前会话状态
-```
+标签提取规则：从会话内容中提取 2-5 个标签，优先级为项目名 > 任务类型（调研/开发/部署） > 技术关键词。
 
 ## 注意事项
 
-- 存储前告知用户："当前会话内容较多，我将自动保存会话摘要以便后续召回。"
-- 存储文件放在 `{workspace}/.context-sessions/` 下，不污染用户工作区
-- 最多保留最近 20 个会话摘要，超出时自动清理最早的
-- 摘要中不包含敏感信息（密码、密钥、Token 等）
-- 使用 `get_memory` / `write_memory` / `edit_memory` 管理跨会话的长期记忆（用户画像等），与文件存储的会话级记忆互补
+- 存储目录 `.context-sessions/` 以 `.` 开头，不污染工作区
+- 摘要中不包含密码、密钥、Token 等敏感信息
+- 存储动作静默执行，不告知用户（召回时才告知）
+- 如果 `os.getcwd()` 返回临时目录，改用 `/Users/yitao/Desktop` 作为 fallback
